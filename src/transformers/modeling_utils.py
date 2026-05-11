@@ -4312,6 +4312,21 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if logger.level >= logging.WARNING:
             verify_tp_plan(expected_keys, getattr(model, "_tp_plan", None))
 
+        if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
+            # With FSDP CPU RAM efficient loading, non-rank-0 processes receive
+            # parameters from rank 0 during FSDP prepare. Returning here avoids
+            # materializing checkpoint tensors on every rank before that sync.
+            return (
+                LoadStateDictInfo(
+                    missing_keys=set(),
+                    unexpected_keys=set(),
+                    mismatched_keys=set(),
+                    conversion_errors={},
+                    error_msgs=[],
+                ),
+                None,
+            )
+
         # This offload index if for params explicitly on the "disk" in the device_map
         disk_offload_index = None
         # Prepare parameters offloading if needed
@@ -4666,9 +4681,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
-            for key, param in self.named_parameters():
-                value = torch.zeros_like(param, device="cpu")
-                _load_parameter_into_model(self, key, value)
             for key, buffer in self.named_buffers():
                 value = torch.zeros_like(buffer, device="cpu")
                 _load_parameter_into_model(self, key, value)
