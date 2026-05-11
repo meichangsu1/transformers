@@ -4312,10 +4312,12 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if logger.level >= logging.WARNING:
             verify_tp_plan(expected_keys, getattr(model, "_tp_plan", None))
 
-        if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
+        fsdp_cpu_ram_efficient_loading = is_fsdp_enabled() and not is_quantized
+        if fsdp_cpu_ram_efficient_loading and not is_local_dist_rank_0():
             # With FSDP CPU RAM efficient loading, non-rank-0 processes receive
             # parameters from rank 0 during FSDP prepare. Returning here avoids
             # materializing checkpoint tensors on every rank before that sync.
+            torch.distributed.barrier()
             return (
                 LoadStateDictInfo(
                     missing_keys=set(),
@@ -4404,6 +4406,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             # finally close all opened file pointers
             for k in all_pointer:
                 k.__exit__(None, None, None)
+
+        if fsdp_cpu_ram_efficient_loading:
+            torch.distributed.barrier()
 
         return loading_info, disk_offload_index
 
