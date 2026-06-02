@@ -42,11 +42,6 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 
 logger = logging.get_logger(__name__)
 
-try:
-    from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
-except ImportError:
-    SparseAttnSharedKV = None
-
 
 def _npu_sparse_attn_shared_kv(
     query,
@@ -72,6 +67,8 @@ def _npu_sparse_attn_shared_kv(
     ori_kv = ori_kv.unsqueeze(2).contiguous()
     cmp_kv = cmp_kv if cmp_kv is None else cmp_kv.unsqueeze(2).contiguous()
     cmp_sparse_indices = None if cmp_ratio != 4 else cmp_sparse_indices.unsqueeze(2).contiguous()
+
+    from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
 
     output = SparseAttnSharedKV.apply(
         query,
@@ -773,7 +770,7 @@ class DeepseekV4Attention(nn.Module):
                 hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
             )
 
-        use_npu_sparse_attention = hidden_states.device.type == "npu" and SparseAttnSharedKV is not None
+        use_npu_sparse_attention = hidden_states.device.type == "npu"
         if use_npu_sparse_attention:
             if self.layer_type == "sliding_attention":
                 cmp_ratio = 1
@@ -788,22 +785,26 @@ class DeepseekV4Attention(nn.Module):
                 cmp_kv = compressed_kv.squeeze(1).contiguous()
                 cmp_sparse_indices = None
 
-            attn_output = (
-                _npu_sparse_attn_shared_kv(
-                    query=q.transpose(1, 2).contiguous(),
-                    ori_kv=ori_kv.squeeze(1).contiguous(),
-                    cmp_kv=cmp_kv,
-                    cmp_sparse_indices=cmp_sparse_indices,
-                    sinks=self.sinks.float(),
-                    softmax_scale=self.scaling,
-                    cmp_ratio=cmp_ratio,
-                    ori_win_left=self.sliding_window - 1,
+            try:
+                attn_output = (
+                    _npu_sparse_attn_shared_kv(
+                        query=q.transpose(1, 2).contiguous(),
+                        ori_kv=ori_kv.squeeze(1).contiguous(),
+                        cmp_kv=cmp_kv,
+                        cmp_sparse_indices=cmp_sparse_indices,
+                        sinks=self.sinks.float(),
+                        softmax_scale=self.scaling,
+                        cmp_ratio=cmp_ratio,
+                        ori_win_left=self.sliding_window - 1,
+                    )
+                    .transpose(1, 2)
+                    .contiguous()
                 )
-                .transpose(1, 2)
-                .contiguous()
-            )
-            attn_weights = None
-        else:
+                attn_weights = None
+            except ImportError:
+                use_npu_sparse_attention = False
+
+        if not use_npu_sparse_attention:
             if compressed_kv is not None:
                 kv = torch.cat([kv, compressed_kv], dim=2)
 
