@@ -1,25 +1,54 @@
---- a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:27:34
-+++ b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:27:34
-@@ -41,6 +41,7 @@
+--- a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 18:01:21
++++ b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 18:01:21
+@@ -11,6 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import os
+ from collections.abc import Callable
  
+ import torch
+@@ -42,6 +43,10 @@
  
  logger = logging.get_logger(__name__)
-+_npu_sparse_attention_patch_logged = False
+ _npu_sparse_attention_patch_logged = False
++
++
++def _deepseek_v4_npu_patch_enabled() -> bool:
++    return os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_PATCH", "0").lower() in {"1", "true", "yes", "on"}
  
  
  def _npu_sparse_attn_shared_kv(
-@@ -796,6 +797,14 @@
-                     cmp_ratio=cmp_ratio,
-                     ori_win_left=self.sliding_window - 1,
-                 )
-+                global _npu_sparse_attention_patch_logged
-+                if not _npu_sparse_attention_patch_logged:
-+                    print(
-+                        "DeepSeek V4 NPU sparse attention patch is active "
-+                        f"(layer_type={self.layer_type}, cmp_ratio={cmp_ratio}, "
-+                        f"topk={0 if cmp_sparse_indices is None else cmp_sparse_indices.shape[-1]})."
-+                    )
-+                    _npu_sparse_attention_patch_logged = True
-                 attn_weights = None
-             except ImportError:
-                 use_npu_sparse_attention = False
+@@ -542,6 +547,23 @@
+         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
++
++        if _deepseek_v4_npu_patch_enabled() and hidden_states.device.type == "npu" and compressed_kv.shape[1] > 0:
++            try:
++                import mindspeed.ops.npu_lightning_indexer as mindspeed_li
++
++                weights = self.weights_proj(hidden_states).to(torch.bfloat16) * self.weights_scaling
++                top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
++                    q.to(torch.bfloat16),
++                    compressed_kv.to(torch.bfloat16).unsqueeze(2),
++                    weights,
++                    sparse_count=self.index_topk,
++                    sparse_mode=3,
++                    cmp_ratio=self.compress_rate,
++                )
++                return top_k_indices.squeeze(2)
++            except ImportError:
++                pass
+ 
+         # ReLU(q·kᵀ) * weights, then top-k
+         scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
+@@ -771,7 +793,7 @@
+                 hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
+             )
+ 
+-        use_npu_sparse_attention = hidden_states.device.type == "npu"
++        use_npu_sparse_attention = _deepseek_v4_npu_patch_enabled() and hidden_states.device.type == "npu"
+         if use_npu_sparse_attention:
+             if self.layer_type == "sliding_attention":
+                 cmp_ratio = 1

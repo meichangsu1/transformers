@@ -17,6 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from collections.abc import Callable
 from typing import Optional
 
@@ -43,6 +44,10 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 
 
 _npu_sparse_attention_patch_logged = False
+
+
+def _deepseek_v4_npu_patch_enabled() -> bool:
+    return os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_PATCH", "0").lower() in {"1", "true", "yes", "on"}
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -553,6 +558,23 @@ class DeepseekV4Indexer(nn.Module):
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
+        if _deepseek_v4_npu_patch_enabled() and hidden_states.device.type == "npu" and compressed_kv.shape[1] > 0:
+            try:
+                import mindspeed.ops.npu_lightning_indexer as mindspeed_li
+
+                weights = self.weights_proj(hidden_states).to(torch.bfloat16) * self.weights_scaling
+                top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
+                    q.to(torch.bfloat16),
+                    compressed_kv.to(torch.bfloat16).unsqueeze(2),
+                    weights,
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    cmp_ratio=self.compress_rate,
+                )
+                return top_k_indices.squeeze(2)
+            except ImportError:
+                pass
+
         # ReLU(q·kᵀ) * weights, then top-k
         scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
         scores = F.relu(scores) * self.softmax_scale
@@ -880,7 +902,7 @@ class DeepseekV4Attention(nn.Module):
                 hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
             )
 
-        use_npu_sparse_attention = hidden_states.device.type == "npu"
+        use_npu_sparse_attention = _deepseek_v4_npu_patch_enabled() and hidden_states.device.type == "npu"
         if use_npu_sparse_attention:
             if self.layer_type == "sliding_attention":
                 cmp_ratio = 1
