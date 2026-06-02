@@ -42,6 +42,65 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 
 logger = logging.get_logger(__name__)
 
+try:
+    from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
+except ImportError:
+    SparseAttnSharedKV = None
+
+
+def _npu_sparse_attn_shared_kv(
+    query,
+    ori_kv,
+    cmp_kv,
+    cmp_sparse_indices,
+    sinks,
+    softmax_scale,
+    cmp_ratio,
+    ori_mask_mode=4,
+    cmp_mask_mode=3,
+    ori_win_left=127,
+    ori_win_right=0,
+):
+    cu_seq_lens_q = cu_seq_lens_ori_kv = cu_seq_lens_cmp_kv = None
+    ori_sparse_indices = None
+    batch_size, max_seq_len_q, num_heads_q, head_dim = query.size()
+    num_heads_kv = 1
+    max_seq_len_kv = ori_kv.size(1)
+    topk = 0 if cmp_ratio != 4 else cmp_sparse_indices.size(-1)
+    layout_q = layout_kv = "BSND"
+    query = query.contiguous()
+    ori_kv = ori_kv.unsqueeze(2).contiguous()
+    cmp_kv = cmp_kv if cmp_kv is None else cmp_kv.unsqueeze(2).contiguous()
+    cmp_sparse_indices = None if cmp_ratio != 4 else cmp_sparse_indices.unsqueeze(2).contiguous()
+
+    output = SparseAttnSharedKV.apply(
+        query,
+        ori_kv,
+        cmp_kv,
+        cu_seq_lens_q,
+        cu_seq_lens_ori_kv,
+        cu_seq_lens_cmp_kv,
+        ori_sparse_indices,
+        cmp_sparse_indices,
+        sinks,
+        softmax_scale,
+        cmp_ratio,
+        ori_mask_mode,
+        cmp_mask_mode,
+        ori_win_left,
+        ori_win_right,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        batch_size,
+        max_seq_len_q,
+        max_seq_len_kv,
+        topk,
+        layout_q,
+        layout_kv,
+    )
+    return output.contiguous()
+
 
 def apply_rotary_pos_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
@@ -368,7 +427,7 @@ class DeepseekV4HCACompressor(nn.Module):
         compressed_len = compressed_kv.shape[2]
         seq_len = position_ids.shape[1]
         if seq_len == 1 or compressed_len == 0:
-            return compressed_kv, None
+            return compressed_kv, None, None
 
         # query `t` may only see cache entries at pos `w` t > w * compress_rate (ex: t=7, w=2 t does not attend to it).
         entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
@@ -378,7 +437,7 @@ class DeepseekV4HCACompressor(nn.Module):
             entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
             float("-inf"),
         )
-        return compressed_kv, block_bias
+        return compressed_kv, block_bias, None
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -623,7 +682,7 @@ class DeepseekV4CSACompressor(nn.Module):
         safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
         block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        return compressed_kv, block_bias[..., :compressed_len]
+        return compressed_kv, block_bias[..., :compressed_len], top_k_indices
 
 
 COMPRESSOR_CLASSES = {
@@ -705,40 +764,76 @@ class DeepseekV4Attention(nn.Module):
         if past_key_values is not None:  # sliding where K==V
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
+        ori_kv = kv
+        compressed_kv = None
         block_bias = None
+        top_k_indices = None
         if self.compressor is not None:  # Compressed KV (CSA or HCA)
-            compressed_kv, block_bias = self.compressor(
+            compressed_kv, block_bias, top_k_indices = self.compressor(
                 hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
             )
-            kv = torch.cat([kv, compressed_kv], dim=2)
 
-        # The compressor path concatenates extra entries onto the KV axis after the
-        # standard sliding-window cache update, so a tensor `attention_mask` (built
-        # for the pre-concat KV length) needs to be extended to cover them. The
-        # compressor returns a `block_bias` carrying per-query causality + indexer
-        # validity over those new slots — cat it in instead of zero-padding (which
-        # would let every query see every compressed slot).
-        if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
-            if block_bias is not None:
-                attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
+        use_npu_sparse_attention = hidden_states.device.type == "npu" and SparseAttnSharedKV is not None
+        if use_npu_sparse_attention:
+            if self.layer_type == "sliding_attention":
+                cmp_ratio = 1
+                cmp_kv = None
+                cmp_sparse_indices = None
+            elif self.layer_type == "compressed_sparse_attention":
+                cmp_ratio = self.config.compress_rates["compressed_sparse_attention"]
+                cmp_kv = compressed_kv.squeeze(1).contiguous()
+                cmp_sparse_indices = top_k_indices.to(torch.int32) if top_k_indices is not None else None
             else:
-                attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+                cmp_ratio = self.config.compress_rates["heavily_compressed_attention"]
+                cmp_kv = compressed_kv.squeeze(1).contiguous()
+                cmp_sparse_indices = None
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-        attn_output, attn_weights = attention_interface(
-            self,
-            q,
-            kv,
-            kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,
-            **kwargs,
-        )
+            attn_output = (
+                _npu_sparse_attn_shared_kv(
+                    query=q.transpose(1, 2).contiguous(),
+                    ori_kv=ori_kv.squeeze(1).contiguous(),
+                    cmp_kv=cmp_kv,
+                    cmp_sparse_indices=cmp_sparse_indices,
+                    sinks=self.sinks.float(),
+                    softmax_scale=self.scaling,
+                    cmp_ratio=cmp_ratio,
+                    ori_win_left=self.sliding_window - 1,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            attn_weights = None
+        else:
+            if compressed_kv is not None:
+                kv = torch.cat([kv, compressed_kv], dim=2)
+
+            # The compressor path concatenates extra entries onto the KV axis after the
+            # standard sliding-window cache update, so a tensor `attention_mask` (built
+            # for the pre-concat KV length) needs to be extended to cover them. The
+            # compressor returns a `block_bias` carrying per-query causality + indexer
+            # validity over those new slots — cat it in instead of zero-padding (which
+            # would let every query see every compressed slot).
+            if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
+                if block_bias is not None:
+                    attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
+                else:
+                    attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                q,
+                kv,
+                kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,
+                **kwargs,
+            )
 
         # K=V in V4, so V picked up rope on its trailing rope slice. Apply the conjugate
         # rotation (`-sin`) at the query position to undo it on the rope slice of the
