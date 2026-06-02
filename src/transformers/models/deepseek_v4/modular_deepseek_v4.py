@@ -41,6 +41,7 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 
 
 logger = logging.get_logger(__name__)
+_npu_sparse_attention_patch_logged = False
 
 
 def _npu_sparse_attn_shared_kv(
@@ -796,6 +797,14 @@ class DeepseekV4Attention(nn.Module):
                     cmp_ratio=cmp_ratio,
                     ori_win_left=self.sliding_window - 1,
                 )
+                global _npu_sparse_attention_patch_logged
+                if not _npu_sparse_attention_patch_logged:
+                    print(
+                        "DeepSeek V4 NPU sparse attention patch is active "
+                        f"(layer_type={self.layer_type}, cmp_ratio={cmp_ratio}, "
+                        f"topk={0 if cmp_sparse_indices is None else cmp_sparse_indices.shape[-1]})."
+                    )
+                    _npu_sparse_attention_patch_logged = True
                 attn_weights = None
             except ImportError:
                 use_npu_sparse_attention = False

@@ -1,31 +1,25 @@
---- a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:13:54
-+++ b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:13:54
-@@ -786,19 +786,15 @@
-                 cmp_sparse_indices = None
+--- a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:27:34
++++ b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py	2026-06-02 17:27:34
+@@ -41,6 +41,7 @@
  
-             try:
--                attn_output = (
--                    _npu_sparse_attn_shared_kv(
--                        query=q.transpose(1, 2).contiguous(),
--                        ori_kv=ori_kv.squeeze(1).contiguous(),
--                        cmp_kv=cmp_kv,
--                        cmp_sparse_indices=cmp_sparse_indices,
--                        sinks=self.sinks.float(),
--                        softmax_scale=self.scaling,
--                        cmp_ratio=cmp_ratio,
--                        ori_win_left=self.sliding_window - 1,
--                    )
--                    .transpose(1, 2)
--                    .contiguous()
-+                attn_output = _npu_sparse_attn_shared_kv(
-+                    query=q.transpose(1, 2).contiguous(),
-+                    ori_kv=ori_kv.squeeze(1).contiguous(),
-+                    cmp_kv=cmp_kv,
-+                    cmp_sparse_indices=cmp_sparse_indices,
-+                    sinks=self.sinks.float(),
-+                    softmax_scale=self.scaling,
-+                    cmp_ratio=cmp_ratio,
-+                    ori_win_left=self.sliding_window - 1,
+ 
+ logger = logging.get_logger(__name__)
++_npu_sparse_attention_patch_logged = False
+ 
+ 
+ def _npu_sparse_attn_shared_kv(
+@@ -796,6 +797,14 @@
+                     cmp_ratio=cmp_ratio,
+                     ori_win_left=self.sliding_window - 1,
                  )
++                global _npu_sparse_attention_patch_logged
++                if not _npu_sparse_attention_patch_logged:
++                    print(
++                        "DeepSeek V4 NPU sparse attention patch is active "
++                        f"(layer_type={self.layer_type}, cmp_ratio={cmp_ratio}, "
++                        f"topk={0 if cmp_sparse_indices is None else cmp_sparse_indices.shape[-1]})."
++                    )
++                    _npu_sparse_attention_patch_logged = True
                  attn_weights = None
              except ImportError:
+                 use_npu_sparse_attention = False
