@@ -893,19 +893,15 @@ class DeepseekV4Attention(nn.Module):
                 cmp_sparse_indices = None
 
             try:
-                attn_output = (
-                    _npu_sparse_attn_shared_kv(
-                        query=q.transpose(1, 2).contiguous(),
-                        ori_kv=ori_kv.squeeze(1).contiguous(),
-                        cmp_kv=cmp_kv,
-                        cmp_sparse_indices=cmp_sparse_indices,
-                        sinks=self.sinks.float(),
-                        softmax_scale=self.scaling,
-                        cmp_ratio=cmp_ratio,
-                        ori_win_left=self.sliding_window - 1,
-                    )
-                    .transpose(1, 2)
-                    .contiguous()
+                attn_output = _npu_sparse_attn_shared_kv(
+                    query=q.transpose(1, 2).contiguous(),
+                    ori_kv=ori_kv.squeeze(1).contiguous(),
+                    cmp_kv=cmp_kv,
+                    cmp_sparse_indices=cmp_sparse_indices,
+                    sinks=self.sinks.float(),
+                    softmax_scale=self.scaling,
+                    cmp_ratio=cmp_ratio,
+                    ori_win_left=self.sliding_window - 1,
                 )
                 attn_weights = None
             except ImportError:
