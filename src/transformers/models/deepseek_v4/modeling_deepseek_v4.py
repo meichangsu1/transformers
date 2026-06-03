@@ -521,7 +521,6 @@ class DeepseekV4Indexer(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
-        use_npu_indexer: bool = False,
     ) -> torch.LongTensor:
         batch, seq_len, _ = hidden_states.shape
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
@@ -573,7 +572,11 @@ class DeepseekV4Indexer(nn.Module):
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
-        if use_npu_indexer and compressed_kv.shape[1] > 0:
+        if (
+            _deepseek_v4_npu_indexer_enabled()
+            and hidden_states.device.type == "npu"
+            and compressed_kv.shape[1] > 0
+        ):
             try:
                 import mindspeed.ops.npu_lightning_indexer as mindspeed_li
 
@@ -657,7 +660,6 @@ class DeepseekV4CSACompressor(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
-        use_npu_indexer: bool = False,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
@@ -720,7 +722,7 @@ class DeepseekV4CSACompressor(nn.Module):
         # attended to. The indexer marks the rest with `-1`; we clamp before the gather and keep the `valid`
         # to drop them from the per-query block mask afterwards.
         top_k_indices = self.indexer(
-            hidden_states, q_residual, position_ids, past_key_values, layer_idx, use_npu_indexer=use_npu_indexer
+            hidden_states, q_residual, position_ids, past_key_values, layer_idx
         )  # [B, S, k]
         compressed_len = compressed_kv.shape[2]
         valid = top_k_indices >= 0  # [B, S, k]
@@ -913,14 +915,13 @@ class DeepseekV4Attention(nn.Module):
 
         is_npu = hidden_states.device.type == "npu"
         use_npu_sparse_attention = _deepseek_v4_npu_sparse_attention_enabled() and is_npu
-        use_npu_indexer = _deepseek_v4_npu_indexer_enabled() and is_npu
         ori_kv = kv
         compressed_kv = None
         block_bias = None
         top_k_indices = None
         if self.compressor is not None:  # Compressed KV (CSA or HCA)
             compressed_kv, block_bias, top_k_indices = self.compressor(
-                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx, use_npu_indexer=use_npu_indexer
+                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
             )
 
         if use_npu_sparse_attention:
