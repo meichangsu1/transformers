@@ -733,6 +733,9 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+_npu_sparse_attn_shared_kv_patch_logged = False
+
+
 def _npu_sparse_attn_shared_kv(
     query,
     ori_kv,
@@ -757,6 +760,17 @@ def _npu_sparse_attn_shared_kv(
     ori_kv = ori_kv.unsqueeze(2).contiguous()
     cmp_kv = cmp_kv if cmp_kv is None else cmp_kv.unsqueeze(2).contiguous()
     cmp_sparse_indices = None if cmp_ratio != 4 else cmp_sparse_indices.unsqueeze(2).contiguous()
+
+    global _npu_sparse_attn_shared_kv_patch_logged
+    if not _npu_sparse_attn_shared_kv_patch_logged:
+        print(
+            "DeepSeek V4 NPU SparseAttnSharedKV patch is active "
+            f"(cmp_ratio={cmp_ratio}, topk={topk}, query_shape={tuple(query.shape)}, "
+            f"ori_kv_shape={tuple(ori_kv.shape)}, "
+            f"cmp_kv_shape={None if cmp_kv is None else tuple(cmp_kv.shape)}, "
+            f"cmp_sparse_indices_shape={None if cmp_sparse_indices is None else tuple(cmp_sparse_indices.shape)})."
+        )
+        _npu_sparse_attn_shared_kv_patch_logged = True
 
     from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
 
