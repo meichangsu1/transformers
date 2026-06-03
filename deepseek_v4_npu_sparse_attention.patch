@@ -1,58 +1,115 @@
 diff --git a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py
-index 07ead6b3a4..360c8df931 100644
+index 360c8df931..9bbc99b4d5 100644
 --- a/src/transformers/models/deepseek_v4/modular_deepseek_v4.py
 +++ b/src/transformers/models/deepseek_v4/modular_deepseek_v4.py
-@@ -511,7 +511,6 @@ class DeepseekV4Indexer(nn.Module):
-         position_ids: torch.Tensor,
-         past_key_values: Cache | None,
-         layer_idx: int,
--        use_npu_indexer: bool = False,
-     ) -> torch.LongTensor:
-         batch, seq_len, _ = hidden_states.shape
-         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
-@@ -563,7 +562,11 @@ class DeepseekV4Indexer(nn.Module):
-         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
-         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+@@ -43,6 +43,7 @@ from .configuration_deepseek_v4 import DeepseekV4Config
  
--        if use_npu_indexer and compressed_kv.shape[1] > 0:
-+        if (
-+            _deepseek_v4_npu_indexer_enabled()
-+            and hidden_states.device.type == "npu"
-+            and compressed_kv.shape[1] > 0
-+        ):
+ logger = logging.get_logger(__name__)
+ _npu_sparse_attention_patch_logged = False
++_npu_indexer_patch_logged = False
+ 
+ 
+ def _deepseek_v4_npu_patch_enabled() -> bool:
+@@ -63,6 +64,37 @@ def _deepseek_v4_npu_indexer_enabled() -> bool:
+     )
+ 
+ 
++def _deepseek_v4_npu_debug_enabled() -> bool:
++    return os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
++
++
++def _deepseek_v4_debug_tensor(name: str, tensor: torch.Tensor):
++    if not _deepseek_v4_npu_debug_enabled():
++        return
++    with torch.no_grad():
++        value = tensor.detach()
++        if value.numel() == 0:
++            print(f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, empty=True")
++            return
++
++        flat = value.reshape(-1)
++        sample = flat[: min(flat.numel(), 4096)].to(torch.float32)
++        checksum = (sample * torch.arange(1, sample.numel() + 1, device=sample.device, dtype=torch.float32)).sum()
++        print(
++            f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
++            f"device={value.device}, sum={sample.sum().item():.6f}, min={sample.min().item():.6f}, "
++            f"max={sample.max().item():.6f}, checksum={checksum.item():.6f}"
++        )
++
++
++def _deepseek_v4_debug_expert_counts(name: str, indices: torch.Tensor, num_experts: int):
++    if not _deepseek_v4_npu_debug_enabled():
++        return
++    with torch.no_grad():
++        counts = torch.bincount(indices.detach().reshape(-1).to(torch.long), minlength=num_experts)
++        _deepseek_v4_debug_tensor(name, counts)
++
++
+ def _npu_sparse_attn_shared_kv(
+     query,
+     ori_kv,
+@@ -570,6 +602,13 @@ class DeepseekV4Indexer(nn.Module):
              try:
                  import mindspeed.ops.npu_lightning_indexer as mindspeed_li
  
-@@ -647,7 +650,6 @@ class DeepseekV4CSACompressor(nn.Module):
-         position_ids: torch.Tensor,
-         past_key_values: Cache | None,
-         layer_idx: int,
--        use_npu_indexer: bool = False,
-     ) -> torch.Tensor:
-         batch, seq_len, _ = hidden_states.shape
-         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
-@@ -710,7 +712,7 @@ class DeepseekV4CSACompressor(nn.Module):
-         # attended to. The indexer marks the rest with `-1`; we clamp before the gather and keep the `valid`
-         # to drop them from the per-query block mask afterwards.
-         top_k_indices = self.indexer(
--            hidden_states, q_residual, position_ids, past_key_values, layer_idx, use_npu_indexer=use_npu_indexer
-+            hidden_states, q_residual, position_ids, past_key_values, layer_idx
-         )  # [B, S, k]
-         compressed_len = compressed_kv.shape[2]
-         valid = top_k_indices >= 0  # [B, S, k]
-@@ -804,14 +806,13 @@ class DeepseekV4Attention(nn.Module):
++                global _npu_indexer_patch_logged
++                if not _npu_indexer_patch_logged:
++                    print(
++                        "DeepSeek V4 NPU indexer patch is active "
++                        f"(sparse_count={self.index_topk}, cmp_ratio={self.compress_rate})."
++                    )
++                    _npu_indexer_patch_logged = True
+                 weights = self.weights_proj(hidden_states).to(torch.bfloat16) * self.weights_scaling
+                 top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
+                     q.to(torch.bfloat16),
+@@ -579,7 +618,9 @@ class DeepseekV4Indexer(nn.Module):
+                     sparse_mode=3,
+                     cmp_ratio=self.compress_rate,
+                 )
+-                return top_k_indices.squeeze(2)
++                top_k_indices = top_k_indices.squeeze(2)
++                _deepseek_v4_debug_tensor("npu_indexer.top_k_indices", top_k_indices)
++                return top_k_indices
+             except ImportError:
+                 pass
  
-         is_npu = hidden_states.device.type == "npu"
-         use_npu_sparse_attention = _deepseek_v4_npu_sparse_attention_enabled() and is_npu
--        use_npu_indexer = _deepseek_v4_npu_indexer_enabled() and is_npu
-         ori_kv = kv
-         compressed_kv = None
-         block_bias = None
-         top_k_indices = None
-         if self.compressor is not None:  # Compressed KV (CSA or HCA)
-             compressed_kv, block_bias, top_k_indices = self.compressor(
--                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx, use_npu_indexer=use_npu_indexer
-+                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
-             )
+@@ -604,9 +645,13 @@ class DeepseekV4Indexer(nn.Module):
+             index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+             top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
+             invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+-            return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
++            top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
++            _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
++            return top_k_indices
  
-         if use_npu_sparse_attention:
+-        return index_scores.topk(top_k, dim=-1).indices
++        top_k_indices = index_scores.topk(top_k, dim=-1).indices
++        _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
++        return top_k_indices
+ 
+ 
+ class DeepseekV4CSACompressor(nn.Module):
+@@ -840,6 +885,7 @@ class DeepseekV4Attention(nn.Module):
+                     cmp_ratio=cmp_ratio,
+                     ori_win_left=self.sliding_window - 1,
+                 )
++                _deepseek_v4_debug_tensor("npu_sfa.attn_output", attn_output)
+                 global _npu_sparse_attention_patch_logged
+                 if not _npu_sparse_attention_patch_logged:
+                     print(
+@@ -1047,6 +1093,7 @@ class DeepseekV4TopKRouter(MixtralTopKRouter):
+         logits = F.linear(flat, self.weight)
+         scores = self.score_fn(logits)
+         indices = torch.topk(scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False).indices
++        _deepseek_v4_debug_expert_counts("topk_router.expert_counts", indices, self.num_experts)
+         weights = scores.gather(1, indices)
+         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+         return logits, weights * self.routed_scaling_factor, indices
+@@ -1074,6 +1121,7 @@ class DeepseekV4HashRouter(MixtralTopKRouter):
+         logits = F.linear(flat, self.weight)
+         scores = self.score_fn(logits)
+         indices = self.tid2eid[input_ids.reshape(-1)].long()
++        _deepseek_v4_debug_expert_counts("hash_router.expert_counts", indices, self.num_experts)
+         weights = scores.gather(1, indices)
+         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+         return logits, weights * self.routed_scaling_factor, indices
