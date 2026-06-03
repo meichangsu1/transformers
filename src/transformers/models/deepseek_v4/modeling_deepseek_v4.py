@@ -656,10 +656,13 @@ class DeepseekV4Indexer(nn.Module):
             top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
             invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
             top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+            if top_k < self.index_topk:
+                padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
+                top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
             _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
             return top_k_indices
 
-        top_k_indices = index_scores.topk(top_k, dim=-1).indices
+        top_k_indices = index_scores.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
         _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
         return top_k_indices
 
