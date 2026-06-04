@@ -45,6 +45,8 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 
 _npu_sparse_attention_patch_logged = False
 _npu_indexer_patch_logged = False
+_npu_debug_call_id = 0
+_npu_debug_last_fingerprints = {}
 
 
 def _deepseek_v4_npu_patch_enabled() -> bool:
@@ -65,17 +67,66 @@ def _deepseek_v4_npu_indexer_enabled() -> bool:
     )
 
 
+def _deepseek_v4_debug_rank_allowed() -> bool:
+    rank_filter = os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_DEBUG_RANK")
+    if not rank_filter:
+        return True
+    allowed = {rank.strip() for rank in rank_filter.split(",") if rank.strip()}
+    return os.environ.get("RANK") in allowed or os.environ.get("LOCAL_RANK") in allowed
+
+
 def _deepseek_v4_npu_debug_enabled() -> bool:
-    return os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+    return (
+        os.environ.get("TRANSFORMERS_DEEPSEEK_V4_NPU_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+        and _deepseek_v4_debug_rank_allowed()
+    )
 
 
-def _deepseek_v4_debug_tensor(name: str, tensor: torch.Tensor):
+def _deepseek_v4_debug_prefix(name: str, context: str | None = None) -> str:
+    global _npu_debug_call_id
+    _npu_debug_call_id += 1
+    prefix = (
+        f"[DeepSeek V4 NPU debug rank={os.environ.get('RANK', '?')} "
+        f"local_rank={os.environ.get('LOCAL_RANK', '?')} pid={os.getpid()} call={_npu_debug_call_id}] {name}"
+    )
+    if context:
+        prefix = f"{prefix} {context}"
+    return f"{prefix}:"
+
+
+def _deepseek_v4_debug_compare_suffix(name: str, context: str | None, fingerprint: tuple) -> str:
+    key = (name, context)
+    previous = _npu_debug_last_fingerprints.get(key)
+    _npu_debug_last_fingerprints[key] = fingerprint
+    if previous is None:
+        return ", compare=first"
+    if previous == fingerprint:
+        return ", compare=same_as_previous"
+    return (
+        ", compare=changed_from_previous"
+        f", previous_shape={previous[0]}, previous_sum={previous[3]:.6f}, previous_checksum={previous[6]:.6f}"
+    )
+
+
+def _deepseek_v4_debug_tensor(
+    name: str, tensor: torch.Tensor, context: str | None = None, compare: bool = False
+):
     if not _deepseek_v4_npu_debug_enabled():
         return
     with torch.no_grad():
+        prefix = _deepseek_v4_debug_prefix(name, context)
         value = tensor.detach()
         if value.numel() == 0:
-            print(f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, empty=True")
+            suffix = (
+                _deepseek_v4_debug_compare_suffix(
+                    name,
+                    context,
+                    (tuple(value.shape), str(value.dtype), str(value.device), 0.0, 0.0, 0.0, 0.0),
+                )
+                if compare
+                else ""
+            )
+            print(f"{prefix} shape={tuple(value.shape)}, dtype={value.dtype}, empty=True{suffix}")
             return
 
         try:
@@ -84,27 +135,50 @@ def _deepseek_v4_debug_tensor(name: str, tensor: torch.Tensor):
             checksum = (
                 sample * torch.arange(1, sample.numel() + 1, device=sample.device, dtype=torch.float32)
             ).sum()
+            sample_sum = sample.sum().item()
+            sample_min = sample.min().item()
+            sample_max = sample.max().item()
+            checksum_value = checksum.item()
+            suffix = (
+                _deepseek_v4_debug_compare_suffix(
+                    name,
+                    context,
+                    (
+                        tuple(value.shape),
+                        str(value.dtype),
+                        str(value.device),
+                        float(sample_sum),
+                        float(sample_min),
+                        float(sample_max),
+                        float(checksum_value),
+                    ),
+                )
+                if compare
+                else ""
+            )
             print(
-                f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
-                f"device={value.device}, sum={sample.sum().item():.6f}, min={sample.min().item():.6f}, "
-                f"max={sample.max().item():.6f}, checksum={checksum.item():.6f}"
+                f"{prefix} shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"device={value.device}, sum={sample_sum:.6f}, min={sample_min:.6f}, "
+                f"max={sample_max:.6f}, checksum={checksum_value:.6f}{suffix}"
             )
         except Exception as error:
             print(
-                f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"{prefix} shape={tuple(value.shape)}, dtype={value.dtype}, "
                 f"device={value.device}, fingerprint_failed={type(error).__name__}: {error}"
             )
 
 
-def _deepseek_v4_debug_expert_counts(name: str, indices: torch.Tensor, num_experts: int):
+def _deepseek_v4_debug_expert_counts(
+    name: str, indices: torch.Tensor, num_experts: int, context: str | None = None
+):
     if not _deepseek_v4_npu_debug_enabled():
         return
     with torch.no_grad():
         try:
             counts = torch.bincount(indices.detach().reshape(-1).to(torch.long), minlength=num_experts)
-            _deepseek_v4_debug_tensor(name, counts)
+            _deepseek_v4_debug_tensor(name, counts, context=context, compare=True)
         except Exception as error:
-            print(f"[DeepSeek V4 NPU debug] {name}: expert_counts_failed={type(error).__name__}: {error}")
+            print(f"{_deepseek_v4_debug_prefix(name, context)} expert_counts_failed={type(error).__name__}: {error}")
 
 
 def _deepseek_v4_debug_indexer_diff(
@@ -113,16 +187,18 @@ def _deepseek_v4_debug_indexer_diff(
     reference_indices: torch.Tensor,
     position_ids: torch.Tensor,
     compress_rate: int,
+    context: str | None = None,
 ):
     if not _deepseek_v4_npu_debug_enabled():
         return
     with torch.no_grad():
+        prefix = _deepseek_v4_debug_prefix(name, context)
         try:
             npu_values = npu_indices.detach().to(torch.long)
             ref_values = reference_indices.detach().to(torch.long)
             if npu_values.shape != ref_values.shape:
                 print(
-                    f"[DeepSeek V4 NPU debug] {name}: shape_mismatch="
+                    f"{prefix} shape_mismatch="
                     f"{tuple(npu_values.shape)} vs {tuple(ref_values.shape)}"
                 )
                 return
@@ -130,7 +206,7 @@ def _deepseek_v4_debug_indexer_diff(
             diff = npu_values != ref_values
             diff_count = int(diff.sum().item())
             if diff_count == 0:
-                print(f"[DeepSeek V4 NPU debug] {name}: diff_count=0")
+                print(f"{prefix} diff_count=0")
                 return
 
             first = diff.nonzero(as_tuple=False)[0]
@@ -142,13 +218,13 @@ def _deepseek_v4_debug_indexer_diff(
             position = int(position_ids.detach()[batch_idx, query_idx].item())
             causal_threshold = (position + 1) // compress_rate
             print(
-                f"[DeepSeek V4 NPU debug] {name}: diff_count={diff_count}, "
+                f"{prefix} diff_count={diff_count}, "
                 f"first_diff=(batch={batch_idx}, query={query_idx}, topk={topk_idx}), "
                 f"position_id={position}, causal_threshold={causal_threshold}, "
                 f"npu_value={npu_value}, reference_value={ref_value}"
             )
         except Exception as error:
-            print(f"[DeepSeek V4 NPU debug] {name}: diff_failed={type(error).__name__}: {error}")
+            print(f"{prefix} diff_failed={type(error).__name__}: {error}")
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -658,6 +734,10 @@ class DeepseekV4Indexer(nn.Module):
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        debug_context = (
+            f"layer_idx={layer_idx} seq_len={seq_len} compressed_len={compressed_kv.shape[1]} "
+            f"compress_rate={self.compress_rate}"
+        )
 
         def torch_indexer_top_k_indices():
             # ReLU(q·kᵀ) * weights, then top-k
@@ -685,11 +765,15 @@ class DeepseekV4Indexer(nn.Module):
                 if top_k < self.index_topk:
                     padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
                     top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
-                _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
+                _deepseek_v4_debug_tensor(
+                    "torch_indexer.top_k_indices", top_k_indices, context=debug_context, compare=True
+                )
                 return top_k_indices
 
             top_k_indices = index_scores.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
-            _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
+            _deepseek_v4_debug_tensor(
+                "torch_indexer.top_k_indices", top_k_indices, context=debug_context, compare=True
+            )
             return top_k_indices
 
         if (
@@ -710,54 +794,37 @@ class DeepseekV4Indexer(nn.Module):
                 weights = self.weights_proj(hidden_states).to(torch.bfloat16) * self.weights_scaling
                 q_indexer = q.to(torch.bfloat16)
                 k_indexer = compressed_kv.to(torch.bfloat16).unsqueeze(2)
-                cu_seq_lens_q = torch.arange(
-                    0, (batch + 1) * seq_len, step=seq_len, device=hidden_states.device, dtype=torch.int32
-                )
-                cu_seq_lens_k = torch.arange(
-                    0,
-                    (batch + 1) * compressed_kv.shape[1],
-                    step=compressed_kv.shape[1],
-                    device=hidden_states.device,
-                    dtype=torch.int32,
-                )
                 try:
                     top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
                         q_indexer,
                         k_indexer,
                         weights,
-                        layout="BSND",
-                        cu_seq_lens_q=cu_seq_lens_q,
-                        cu_seq_lens_k=cu_seq_lens_k,
                         sparse_count=self.index_topk,
                         sparse_mode=3,
                         cmp_ratio=self.compress_rate,
                     )
-                except TypeError:
-                    try:
-                        top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
-                            q_indexer,
-                            k_indexer,
-                            weights,
-                            sparse_count=self.index_topk,
-                            sparse_mode=3,
-                            cmp_ratio=self.compress_rate,
-                        )
-                    except NameError:
-                        return torch_indexer_top_k_indices()
                 except NameError:
                     return torch_indexer_top_k_indices()
                 top_k_indices = top_k_indices.squeeze(2)
-                _deepseek_v4_debug_tensor("npu_indexer.top_k_indices", top_k_indices)
+                _deepseek_v4_debug_tensor(
+                    "npu_indexer.top_k_indices", top_k_indices, context=debug_context, compare=True
+                )
                 if _deepseek_v4_npu_debug_enabled():
                     with torch.no_grad():
                         reference_top_k_indices = torch_indexer_top_k_indices()
-                        _deepseek_v4_debug_tensor("torch_indexer.reference_top_k_indices", reference_top_k_indices)
+                        _deepseek_v4_debug_tensor(
+                            "torch_indexer.reference_top_k_indices",
+                            reference_top_k_indices,
+                            context=debug_context,
+                            compare=True,
+                        )
                         _deepseek_v4_debug_indexer_diff(
                             "npu_vs_torch_indexer",
                             top_k_indices,
                             reference_top_k_indices,
                             position_ids,
                             self.compress_rate,
+                            context=debug_context,
                         )
                 return top_k_indices
             except ImportError:
@@ -1086,6 +1153,25 @@ class DeepseekV4Attention(nn.Module):
                 cmp_sparse_indices = None
 
             try:
+                sfa_debug_context = (
+                    f"layer_idx={self.layer_idx} layer_type={self.layer_type} seq_len={hidden_states.shape[1]} "
+                    f"ori_kv_len={ori_kv.shape[2]} cmp_ratio={cmp_ratio} "
+                    f"topk={0 if cmp_sparse_indices is None else cmp_sparse_indices.shape[-1]}"
+                )
+                if _deepseek_v4_npu_debug_enabled():
+                    _deepseek_v4_debug_tensor(
+                        "npu_sfa.query", q.transpose(1, 2), context=sfa_debug_context
+                    )
+                    _deepseek_v4_debug_tensor("npu_sfa.ori_kv", ori_kv, context=sfa_debug_context)
+                    if cmp_kv is not None:
+                        _deepseek_v4_debug_tensor("npu_sfa.cmp_kv", cmp_kv, context=sfa_debug_context)
+                    if cmp_sparse_indices is not None:
+                        _deepseek_v4_debug_tensor(
+                            "npu_sfa.cmp_sparse_indices",
+                            cmp_sparse_indices,
+                            context=sfa_debug_context,
+                            compare=True,
+                        )
                 attn_output = _npu_sparse_attn_shared_kv(
                     query=q.transpose(1, 2).contiguous(),
                     ori_kv=ori_kv.squeeze(1).contiguous(),
@@ -1096,7 +1182,9 @@ class DeepseekV4Attention(nn.Module):
                     cmp_ratio=cmp_ratio,
                     ori_win_left=self.sliding_window - 1,
                 )
-                _deepseek_v4_debug_tensor("npu_sfa.attn_output", attn_output)
+                _deepseek_v4_debug_tensor(
+                    "npu_sfa.attn_output", attn_output, context=sfa_debug_context, compare=True
+                )
                 global _npu_sparse_attention_patch_logged
                 if not _npu_sparse_attention_patch_logged:
                     print(
@@ -1326,7 +1414,6 @@ class DeepseekV4TopKRouter(nn.Module):
         logits = F.linear(flat, self.weight)
         scores = self.score_fn(logits)
         indices = torch.topk(scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False).indices
-        _deepseek_v4_debug_expert_counts("topk_router.expert_counts", indices, self.num_experts)
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices
@@ -1358,7 +1445,6 @@ class DeepseekV4HashRouter(nn.Module):
         logits = F.linear(flat, self.weight)
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
-        _deepseek_v4_debug_expert_counts("hash_router.expert_counts", indices, self.num_experts)
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices
@@ -1367,6 +1453,7 @@ class DeepseekV4HashRouter(nn.Module):
 class DeepseekV4SparseMoeBlock(nn.Module):
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
         self.gate = DeepseekV4HashRouter(config) if self.is_hash else DeepseekV4TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
@@ -1380,6 +1467,16 @@ class DeepseekV4SparseMoeBlock(nn.Module):
             _, weights, indices = self.gate(hidden_states, input_ids)
         else:
             _, weights, indices = self.gate(hidden_states)
+        router_name = "hash_router" if self.is_hash else "topk_router"
+        _deepseek_v4_debug_expert_counts(
+            f"{router_name}.expert_counts",
+            indices,
+            self.gate.num_experts,
+            context=(
+                f"layer_idx={self.layer_idx} mlp_type={'hash_moe' if self.is_hash else 'moe'} "
+                f"batch={batch} seq_len={seq_len}"
+            ),
+        )
         routed = self.experts(flat, indices, weights).view(batch, seq_len, hidden_dim)
         return routed + self.shared_experts(residual)
 
