@@ -77,22 +77,77 @@ def _deepseek_v4_debug_tensor(name: str, tensor: torch.Tensor):
             print(f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, empty=True")
             return
 
-        flat = value.reshape(-1)
-        sample = flat[: min(flat.numel(), 4096)].to(torch.float32)
-        checksum = (sample * torch.arange(1, sample.numel() + 1, device=sample.device, dtype=torch.float32)).sum()
-        print(
-            f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
-            f"device={value.device}, sum={sample.sum().item():.6f}, min={sample.min().item():.6f}, "
-            f"max={sample.max().item():.6f}, checksum={checksum.item():.6f}"
-        )
+        try:
+            flat = value.reshape(-1)
+            sample = flat[: min(flat.numel(), 4096)].to(torch.float32)
+            checksum = (
+                sample * torch.arange(1, sample.numel() + 1, device=sample.device, dtype=torch.float32)
+            ).sum()
+            print(
+                f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"device={value.device}, sum={sample.sum().item():.6f}, min={sample.min().item():.6f}, "
+                f"max={sample.max().item():.6f}, checksum={checksum.item():.6f}"
+            )
+        except Exception as error:
+            print(
+                f"[DeepSeek V4 NPU debug] {name}: shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"device={value.device}, fingerprint_failed={type(error).__name__}: {error}"
+            )
 
 
 def _deepseek_v4_debug_expert_counts(name: str, indices: torch.Tensor, num_experts: int):
     if not _deepseek_v4_npu_debug_enabled():
         return
     with torch.no_grad():
-        counts = torch.bincount(indices.detach().reshape(-1).to(torch.long), minlength=num_experts)
-        _deepseek_v4_debug_tensor(name, counts)
+        try:
+            counts = torch.bincount(indices.detach().reshape(-1).to(torch.long), minlength=num_experts)
+            _deepseek_v4_debug_tensor(name, counts)
+        except Exception as error:
+            print(f"[DeepSeek V4 NPU debug] {name}: expert_counts_failed={type(error).__name__}: {error}")
+
+
+def _deepseek_v4_debug_indexer_diff(
+    name: str,
+    npu_indices: torch.Tensor,
+    reference_indices: torch.Tensor,
+    position_ids: torch.Tensor,
+    compress_rate: int,
+):
+    if not _deepseek_v4_npu_debug_enabled():
+        return
+    with torch.no_grad():
+        try:
+            npu_values = npu_indices.detach().to(torch.long)
+            ref_values = reference_indices.detach().to(torch.long)
+            if npu_values.shape != ref_values.shape:
+                print(
+                    f"[DeepSeek V4 NPU debug] {name}: shape_mismatch="
+                    f"{tuple(npu_values.shape)} vs {tuple(ref_values.shape)}"
+                )
+                return
+
+            diff = npu_values != ref_values
+            diff_count = int(diff.sum().item())
+            if diff_count == 0:
+                print(f"[DeepSeek V4 NPU debug] {name}: diff_count=0")
+                return
+
+            first = diff.nonzero(as_tuple=False)[0]
+            batch_idx = int(first[0].item())
+            query_idx = int(first[1].item())
+            topk_idx = int(first[2].item())
+            npu_value = int(npu_values[batch_idx, query_idx, topk_idx].item())
+            ref_value = int(ref_values[batch_idx, query_idx, topk_idx].item())
+            position = int(position_ids.detach()[batch_idx, query_idx].item())
+            causal_threshold = (position + 1) // compress_rate
+            print(
+                f"[DeepSeek V4 NPU debug] {name}: diff_count={diff_count}, "
+                f"first_diff=(batch={batch_idx}, query={query_idx}, topk={topk_idx}), "
+                f"position_id={position}, causal_threshold={causal_threshold}, "
+                f"npu_value={npu_value}, reference_value={ref_value}"
+            )
+        except Exception as error:
+            print(f"[DeepSeek V4 NPU debug] {name}: diff_failed={type(error).__name__}: {error}")
 
 
 def _npu_sparse_attn_shared_kv(
@@ -685,7 +740,15 @@ class DeepseekV4Indexer(nn.Module):
                 _deepseek_v4_debug_tensor("npu_indexer.top_k_indices", top_k_indices)
                 if _deepseek_v4_npu_debug_enabled():
                     with torch.no_grad():
-                        _deepseek_v4_debug_tensor("torch_indexer.reference_top_k_indices", torch_indexer_top_k_indices())
+                        reference_top_k_indices = torch_indexer_top_k_indices()
+                        _deepseek_v4_debug_tensor("torch_indexer.reference_top_k_indices", reference_top_k_indices)
+                        _deepseek_v4_debug_indexer_diff(
+                            "npu_vs_torch_indexer",
+                            top_k_indices,
+                            reference_top_k_indices,
+                            position_ids,
+                            self.compress_rate,
+                        )
                 return top_k_indices
             except ImportError:
                 pass
