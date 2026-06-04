@@ -604,6 +604,39 @@ class DeepseekV4Indexer(nn.Module):
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
 
+        def torch_indexer_top_k_indices():
+            # ReLU(q·kᵀ) * weights, then top-k
+            scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
+            scores = F.relu(scores) * self.softmax_scale
+            weights = self.weights_proj(hidden_states).float() * self.weights_scaling  # [B, S, H]
+            index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+            compressed_len = compressed_kv.shape[1]
+            top_k = min(self.index_topk, compressed_len)
+
+            # not all queries can attend to the compressed entries. If a query's position
+            # is small than the relative position of the key (say m=4, query 2 cannot attend
+            # to compressed key at position 4, because it compressed info for states at position
+            # 12 to 16. Thus we need to make sure that top_k does not land in that range.
+            # Picks that still point past `causal_threshold` (early queries with too few ready
+            # blocks) are replaced with a `-1` sentinel that the compresser treats as invalid.
+            if compressed_len > 0:
+                causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+                entry_indices = torch.arange(compressed_len, device=index_scores.device)
+                future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
+                index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+                top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
+                invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+                top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+                if top_k < self.index_topk:
+                    padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
+                    top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
+                _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
+                return top_k_indices
+
+            top_k_indices = index_scores.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
+            _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
+            return top_k_indices
+
         if (
             _deepseek_v4_npu_indexer_enabled()
             and hidden_states.device.type == "npu"
@@ -620,51 +653,54 @@ class DeepseekV4Indexer(nn.Module):
                     )
                     _npu_indexer_patch_logged = True
                 weights = self.weights_proj(hidden_states).to(torch.bfloat16) * self.weights_scaling
-                top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
-                    q.to(torch.bfloat16),
-                    compressed_kv.to(torch.bfloat16).unsqueeze(2),
-                    weights,
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    cmp_ratio=self.compress_rate,
+                q_indexer = q.to(torch.bfloat16)
+                k_indexer = compressed_kv.to(torch.bfloat16).unsqueeze(2)
+                cu_seq_lens_q = torch.arange(
+                    0, (batch + 1) * seq_len, step=seq_len, device=hidden_states.device, dtype=torch.int32
                 )
+                cu_seq_lens_k = torch.arange(
+                    0,
+                    (batch + 1) * compressed_kv.shape[1],
+                    step=compressed_kv.shape[1],
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
+                try:
+                    top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
+                        q_indexer,
+                        k_indexer,
+                        weights,
+                        layout="BSND",
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        sparse_count=self.index_topk,
+                        sparse_mode=3,
+                        cmp_ratio=self.compress_rate,
+                    )
+                except TypeError:
+                    try:
+                        top_k_indices, _ = mindspeed_li.npu_lightning_indexer(
+                            q_indexer,
+                            k_indexer,
+                            weights,
+                            sparse_count=self.index_topk,
+                            sparse_mode=3,
+                            cmp_ratio=self.compress_rate,
+                        )
+                    except NameError:
+                        return torch_indexer_top_k_indices()
+                except NameError:
+                    return torch_indexer_top_k_indices()
                 top_k_indices = top_k_indices.squeeze(2)
                 _deepseek_v4_debug_tensor("npu_indexer.top_k_indices", top_k_indices)
+                if _deepseek_v4_npu_debug_enabled():
+                    with torch.no_grad():
+                        _deepseek_v4_debug_tensor("torch_indexer.reference_top_k_indices", torch_indexer_top_k_indices())
                 return top_k_indices
             except ImportError:
                 pass
 
-        # ReLU(q·kᵀ) * weights, then top-k
-        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
-        scores = F.relu(scores) * self.softmax_scale
-        weights = self.weights_proj(hidden_states).float() * self.weights_scaling  # [B, S, H]
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
-        compressed_len = compressed_kv.shape[1]
-        top_k = min(self.index_topk, compressed_len)
-
-        # not all queries can attend to the compressed entries. If a query's position
-        # is small than the relative position of the key (say m=4, query 2 cannot attend
-        # to compressed key at position 4, because it compressed info for states at position
-        # 12 to 16. Thus we need to make sure that top_k does not land in that range.
-        # Picks that still point past `causal_threshold` (early queries with too few ready
-        # blocks) are replaced with a `-1` sentinel that the compresser treats as invalid.
-        if compressed_len > 0:
-            causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
-            entry_indices = torch.arange(compressed_len, device=index_scores.device)
-            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
-            index_scores = index_scores.masked_fill(future_mask, float("-inf"))
-            top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
-            invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
-            top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
-            if top_k < self.index_topk:
-                padding = top_k_indices.new_full((batch, seq_len, self.index_topk - top_k), -1)
-                top_k_indices = torch.cat([top_k_indices, padding], dim=-1)
-            _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
-            return top_k_indices
-
-        top_k_indices = index_scores.new_full((batch, seq_len, self.index_topk), -1, dtype=torch.long)
-        _deepseek_v4_debug_tensor("torch_indexer.top_k_indices", top_k_indices)
-        return top_k_indices
+        return torch_indexer_top_k_indices()
 
 
 class DeepseekV4CSACompressor(nn.Module):
